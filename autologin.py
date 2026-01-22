@@ -1,3 +1,4 @@
+# autologin.py
 import os
 import sys
 import json
@@ -15,7 +16,12 @@ from PIL import Image
 
 # ================= CONFIG =================
 CONFIG_PATH = os.path.expanduser("~/.autologin.txt")
-ICON_PATH = os.path.expanduser("~/.local/share/icons/meerkat.png")
+
+# Se você quiser usar o ícone externo:
+ICON_EXTERNAL_PATH = os.path.expanduser("~/.local/share/icons/autologin.png")
+
+# Nome do ícone embutido no build (PyInstaller --add-data "autologin.png:.")
+ICON_EMBED_NAME = "autologin.png"
 
 COOLDOWN_S = 1.5
 pyautogui.FAILSAFE = True
@@ -25,15 +31,61 @@ running = True
 # ==========================================
 
 
-# ============ GUI (Zenity + fallback) =====
-def _has_zenity() -> bool:
+# ============ RESOURCE PATH (PyInstaller) ==
+def resource_path(relative_path: str) -> str:
+    """
+    Resolve caminho de arquivo tanto em execução normal quanto empacotado (PyInstaller).
+    """
+    base = getattr(sys, "_MEIPASS", os.path.abspath("."))
+    return os.path.join(base, relative_path)
+
+
+def get_icon_path() -> str:
+    """
+    Prioridade:
+      1) ícone externo (~/.local/share/icons/autologin.png)
+      2) ícone embutido (autologin.png via PyInstaller)
+    """
+    if os.path.exists(ICON_EXTERNAL_PATH):
+        return ICON_EXTERNAL_PATH
+
+    embedded = resource_path(ICON_EMBED_NAME)
+    if os.path.exists(embedded):
+        return embedded
+
+    # último fallback: nada
+    return ""
+# ==========================================
+
+
+# ============ GUI HELPERS (YAD -> Zenity) ==
+def _has_cmd(cmd: str) -> bool:
     from shutil import which
-    return which("zenity") is not None
+    return which(cmd) is not None
 
 
-def gui_entry(title: str, text: str) -> str | None:
-    """Entrada de texto via Zenity. Retorna None se cancelar."""
-    if _has_zenity():
+def gui_entry(title: str, text: str, field_label: str = "Texto") -> str | None:
+    """Entrada de texto via YAD (fallback Zenity)."""
+    if _has_cmd("yad"):
+        p = subprocess.run(
+            [
+                "yad", "--form",
+                f"--title={title}",
+                f"--text={text}",
+                "--separator=",
+                f"--field={field_label}:",
+                "--button=OK:0",
+                "--button=Cancelar:1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if p.returncode != 0:
+            return None
+        return p.stdout.strip()
+
+    if _has_cmd("zenity"):
         p = subprocess.run(
             ["zenity", "--entry", f"--title={title}", f"--text={text}"],
             stdout=subprocess.PIPE,
@@ -44,24 +96,34 @@ def gui_entry(title: str, text: str) -> str | None:
             return None
         return p.stdout.rstrip("\n")
 
-    # Fallback Tkinter
-    import tkinter as tk
-    from tkinter import simpledialog
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    root.lift()
-    root.focus_force()
-    try:
-        v = simpledialog.askstring(title, text)
-    finally:
-        root.destroy()
-    return v
+    return None
 
 
-def gui_password(title: str, text: str) -> str | None:
-    """Senha via Zenity. Retorna None se cancelar."""
-    if _has_zenity():
+def gui_password(title: str, text: str, label: str = "Senha") -> str | None:
+    """
+    Senha via YAD com label customizável (ex: 'Senha mestra').
+    Fallback para zenity --password (label não customizável).
+    """
+    if _has_cmd("yad"):
+        p = subprocess.run(
+            [
+                "yad", "--form",
+                f"--title={title}",
+                f"--text={text}",
+                "--separator=",
+                f"--field={label}:H",
+                "--button=OK:0",
+                "--button=Cancelar:1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if p.returncode != 0:
+            return None
+        return p.stdout.strip()
+
+    if _has_cmd("zenity"):
         p = subprocess.run(
             ["zenity", "--password", f"--title={title}", f"--text={text}"],
             stdout=subprocess.PIPE,
@@ -72,55 +134,29 @@ def gui_password(title: str, text: str) -> str | None:
             return None
         return p.stdout.rstrip("\n")
 
-    # Fallback Tkinter
-    import tkinter as tk
-    from tkinter import simpledialog
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    root.lift()
-    root.focus_force()
-    try:
-        v = simpledialog.askstring(title, text, show="*")
-    finally:
-        root.destroy()
-    return v
+    return None
 
 
 def gui_error(msg: str):
-    if _has_zenity():
+    if _has_cmd("yad"):
+        subprocess.run(["yad", "--error", "--title=AutoLogin", f"--text={msg}"],
+                       stderr=subprocess.DEVNULL)
+        return
+    if _has_cmd("zenity"):
         subprocess.run(["zenity", "--error", "--title=AutoLogin", f"--text={msg}"],
                        stderr=subprocess.DEVNULL)
         return
-    import tkinter as tk
-    from tkinter import messagebox
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    root.lift()
-    root.focus_force()
-    try:
-        messagebox.showerror("AutoLogin", msg)
-    finally:
-        root.destroy()
 
 
 def gui_info(msg: str):
-    if _has_zenity():
+    if _has_cmd("yad"):
+        subprocess.run(["yad", "--info", "--title=AutoLogin", f"--text={msg}"],
+                       stderr=subprocess.DEVNULL)
+        return
+    if _has_cmd("zenity"):
         subprocess.run(["zenity", "--info", "--title=AutoLogin", f"--text={msg}"],
                        stderr=subprocess.DEVNULL)
         return
-    import tkinter as tk
-    from tkinter import messagebox
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    root.lift()
-    root.focus_force()
-    try:
-        messagebox.showinfo("AutoLogin", msg)
-    finally:
-        root.destroy()
 # ==========================================
 
 
@@ -134,7 +170,7 @@ def save_credentials(usuario: str, senha: str, master: str):
     fernet = Fernet(derive_key(master))
     data = {
         "usuario": usuario,
-        "senha_enc": fernet.encrypt(senha.encode()).decode()
+        "senha_enc": fernet.encrypt(senha.encode("utf-8")).decode("utf-8"),
     }
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f)
@@ -150,7 +186,7 @@ def load_credentials(master: str):
 
     fernet = Fernet(derive_key(master))
     try:
-        senha = fernet.decrypt(data["senha_enc"].encode()).decode()
+        senha = fernet.decrypt(data["senha_enc"].encode("utf-8")).decode("utf-8")
     except Exception:
         raise ValueError("Senha mestra incorreta (ou arquivo corrompido).")
 
@@ -163,19 +199,19 @@ def load_credentials(master: str):
 
 # ============ SETUP (GUI) =================
 def first_setup_gui():
-    usuario = gui_entry("AutoLogin", "Usuário:")
+    usuario = gui_entry("AutoLogin", "Digite seu usuário:", field_label="Usuário")
     if usuario is None:
         sys.exit(0)
 
-    senha = gui_password("AutoLogin", "Senha:")
+    senha = gui_password("AutoLogin", "Digite sua senha:", label="Senha")
     if senha is None:
         sys.exit(0)
 
-    master1 = gui_password("AutoLogin", "Crie uma senha mestra:")
+    master1 = gui_password("AutoLogin", "Crie uma senha mestra:", label="Senha mestra")
     if master1 is None:
         sys.exit(0)
 
-    master2 = gui_password("AutoLogin", "Repita a senha mestra:")
+    master2 = gui_password("AutoLogin", "Repita a senha mestra:", label="Senha mestra (repetir)")
     if master2 is None:
         sys.exit(0)
 
@@ -199,7 +235,7 @@ def load_or_setup():
     if not os.path.exists(CONFIG_PATH):
         return first_setup_gui()
 
-    master = gui_password("AutoLogin", "Senha mestra:")
+    master = gui_password("AutoLogin", "Digite sua senha mestra:", label="Senha mestra")
     if master is None or not master:
         sys.exit(0)
 
@@ -212,7 +248,7 @@ def load_or_setup():
 
 
 # ============ AUTOFILL ====================
-def preencher_login(usuario, senha):
+def preencher_login(usuario: str, senha: str):
     time.sleep(0.15)
     pyautogui.write(usuario, interval=0.03)
     pyautogui.press("tab")
@@ -220,7 +256,7 @@ def preencher_login(usuario, senha):
     pyautogui.press("enter")
 
 
-def keyboard_listener(usuario, senha):
+def keyboard_listener(usuario: str, senha: str):
     global _ultimo_disparo, running
 
     def on_press(key):
@@ -231,7 +267,11 @@ def keyboard_listener(usuario, senha):
             agora = time.time()
             if agora - _ultimo_disparo >= COOLDOWN_S:
                 _ultimo_disparo = agora
-                preencher_login(usuario, senha)
+                try:
+                    preencher_login(usuario, senha)
+                except Exception:
+                    # evita crash silencioso do listener
+                    pass
 
     with keyboard.Listener(on_press=on_press) as listener:
         listener.join()
@@ -239,11 +279,15 @@ def keyboard_listener(usuario, senha):
 
 
 # ============ TRAY ICON ====================
-def load_icon():
-    if not os.path.exists(ICON_PATH):
-        gui_error(f"Ícone não encontrado em:\n{ICON_PATH}\n\nAjuste ICON_PATH no script.")
-        sys.exit(1)
-    img = Image.open(ICON_PATH).convert("RGBA").resize((64, 64))
+def load_icon_image() -> Image.Image:
+    icon_path = get_icon_path()
+    if not icon_path:
+        # fallback: cria um ícone simples
+        img = Image.new("RGBA", (64, 64), (40, 40, 40, 255))
+        return img
+
+    img = Image.open(icon_path).convert("RGBA")
+    img = img.resize((64, 64))
     return img
 
 
@@ -264,19 +308,18 @@ def tray_app():
 
     menu = pystray.Menu(
         pystray.MenuItem("Resetar credenciais", reset),
-        pystray.MenuItem("Sair", sair)
+        pystray.MenuItem("Sair", sair),
     )
 
     icon = pystray.Icon(
         "AutoLogin",
-        load_icon(),
+        load_icon_image(),
         "AutoLogin (F12)",
-        menu
+        menu,
     )
 
-    # Aviso rápido de “tá rodando”
     try:
-        icon.notify("AutoLogin ativo (F12 para preencher)")
+        icon.notify("Suricato AutoLogin ativo (F12 para preencher)")
     except Exception:
         pass
 
