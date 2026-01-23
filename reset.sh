@@ -1,92 +1,41 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# ======================================================================================
+# reset.sh — Documentação (v1.1)
+# Autor: Gustavo Pires
+# Data: 2026-01-23
+# Suricato AutoLogin (F12) - RESET (Linux)
+# Versão: 1.1
+# Objetivo: Limpar configurações, ícones e binários do sistema.
+# ======================================================================================
 
-echo "============================================"
-echo " RESETANDO AMBIENTE PARA TESTE DO ZERO"
-echo " Projeto: Suricato AutoLogin"
-echo "============================================"
-echo
+# Fail-fast: encerra ao primeiro erro de comando (exceto onde há '|| true').
+set -e
 
-read -r -p "⚠️ Isso removerá dependências e arquivos do projeto. Continuar? (s/N): " CONF
-[[ "${CONF:-}" =~ ^[sS]$ ]] || exit 0
+# Identificador usado para compor caminhos/pastas relacionados ao app.
+APP_SLUG="suricato_autologin"
+CONFIG_DIR="$HOME/.config/$APP_SLUG"
+BIN_PATH="$HOME/Apps/autologin"
+DESKTOP_FILE="$HOME/.local/share/applications/autologin.desktop"
+ICON_FILE="$HOME/.local/share/icons/autologin.png"
 
-echo
-echo "🔹 1/7 Removendo dependências Python (pip --user)..."
+# Execução principal: remove config, binário e atalhos.
+echo "Iniciando Limpeza: Suricato AutoLogin v1.1"
 
-python3 -m pip uninstall -y \
-  PyAutoGUI MouseInfo PyGetWindow PyMsgBox PyRect PyScreeze pytweening pyperclip python-xlib \
-  pynput evdev \
-  pystray pillow \
-  cryptography cffi \
-  pyinstaller pyinstaller-hooks-contrib altgraph \
-  >/dev/null 2>&1 || true
+# Remove arquivos de configuração e credenciais (CUIDADO: deleta a senha mestra)
+if [ -d "$CONFIG_DIR" ]; then
+    echo "Removendo configurações em $CONFIG_DIR"
+    rm -rf "$CONFIG_DIR"
+fi
 
-echo "✔ Dependências Python removidas"
+# Remove o binário compilado
+if [ -f "$BIN_PATH" ]; then
+    echo "Removendo executável..."
+    rm "$BIN_PATH"
+fi
 
-echo
-echo "🔹 2/7 Removendo arquivos instalados pelo Suricato..."
+# Remove atalhos do sistema
+rm -f "$DESKTOP_FILE"
+rm -f "$ICON_FILE"
+rm -f "$HOME/Desktop/Suricato AutoLogin.desktop"
 
-rm -f "$HOME/Apps/autologin"
-rm -f "$HOME/.local/share/applications/autologin.desktop"
-rm -f "$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")/Suricato AutoLogin.desktop"
-rm -f "$HOME/.local/share/icons/autologin.png"
-rm -rf "$HOME/.cache/autologin"
-rm -f "$HOME/.autologin.txt"
-
-update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
-
-echo "✔ Arquivos do projeto removidos"
-
-echo
-echo "🔹 3/7 Removendo dependências GUI (APT)..."
-echo "   (pode pedir senha de administrador)"
-
-# GUI usadas pelo setup/app
-sudo apt remove -y \
-  yad \
-  zenity \
-  >/dev/null 2>&1 || true
-
-echo "✔ GUI removidas"
-
-echo
-echo "🔹 4/7 Removendo dependências de sistema adicionais (APT)..."
-
-# Dependências que o setup tenta instalar
-sudo apt remove -y \
-  python3-pip \
-  python3-tk \
-  scrot \
-  >/dev/null 2>&1 || true
-
-sudo apt autoremove -y >/dev/null 2>&1 || true
-
-echo "✔ Dependências de sistema removidas"
-
-echo
-echo "🔹 5/7 Limpando cache do pip..."
-
-rm -rf "$HOME/.cache/pip"
-
-echo "✔ Cache limpo"
-
-echo
-echo "🔹 6/7 Verificações finais (o esperado é estar AUSENTE)..."
-
-command -v yad >/dev/null 2>&1 || echo "✔ yad AUSENTE"
-command -v zenity >/dev/null 2>&1 || echo "✔ zenity AUSENTE"
-python3 -m pip --version >/dev/null 2>&1 || echo "✔ pip AUSENTE"
-python3 - << 'EOF' >/dev/null 2>&1 || echo "✔ libs Python removidas"
-import pyautogui, pynput, pystray, cryptography, PIL, PyInstaller  # noqa
-EOF
-
-echo
-echo "🔹 7/7 Ambiente pronto para teste"
-
-echo
-echo "============================================"
-echo " ✅ RESET CONCLUÍDO"
-echo
-echo " Agora teste:"
-echo "   bash autologin_setup.sh"
-echo "============================================"
+echo "Sistema limpo por Gustavo Pires."

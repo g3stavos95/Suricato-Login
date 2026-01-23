@@ -1,7 +1,10 @@
-﻿# autologin_setup.ps1
+﻿# ======================================================================================
+# autologin_setup.ps1 — Documentação (v1.1)
+# Autor: Gustavo Pires
+# Data: 2026-01-23
 # ======================================================================================
 # Suricato AutoLogin (F12) - Windows 10/11
-# Versão: 1.0
+# Versão: 1.1
 # ======================================================================================
 # Objetivo:
 #   Automatizar o setup do Suricato AutoLogin no Windows:
@@ -11,12 +14,6 @@
 #     4) Converter PNG -> ICO (para atalhos do Windows)
 #     5) Buildar autologin.exe com PyInstaller (onefile + noconsole) embutindo autologin.png
 #     6) Criar atalhos no Desktop e no Menu Iniciar
-#
-# Por que este script é “robusto”:
-#   - Nunca executa python.exe sem argumentos (isso abriria REPL e “travaria”)
-#   - Nunca usa py.exe como runtime (py.exe é só para descobrir o python.exe real)
-#   - pip pode escrever WARNING em stderr mesmo com sucesso: aqui isso NÃO quebra o setup
-#   - Evita bug clássico: Join-Path com vírgula (ChildPath vira Object[] e explode)
 # ======================================================================================
 
 Set-StrictMode -Version Latest
@@ -129,6 +126,7 @@ function Pick-File([string]$Title, [string]$Filter) {
 # ======================================================================================
 # Runner robusto (corrige “pip WARNING quebra o script”)
 # ======================================================================================
+# Runner robusto: captura stdout/stderr, e só falha se ExitCode != 0.
 function Run {
   [CmdletBinding()]
   param(
@@ -199,6 +197,7 @@ function Test-RealPython([string]$PythonExe) {
   }
 }
 
+# Resolve python.exe real evitando alias do WindowsApps e evitando bugs com Join-Path/arrays.
 function Resolve-PythonExe {
   # 1) python no PATH (evita alias WindowsApps)
   $cmd = Get-Command python -ErrorAction SilentlyContinue
@@ -268,6 +267,7 @@ function Ensure-Pip {
   Run $script:PYTHON_EXE -m pip --version
 }
 
+# Instala/atualiza dependências necessárias ao app e ao build (PyInstaller).
 function Ensure-Deps {
   # Dependências do app + build
   $pkgs = @("pyautogui","pynput","cryptography","pystray","pillow","pyinstaller")
@@ -279,6 +279,7 @@ function Ensure-Deps {
 # ======================================================================================
 # PNG -> ICO (Pillow)
 # ======================================================================================
+# Converte PNG em ICO via Pillow para ícone correto em atalhos do Windows.
 function Convert-PngToIco([string]$PngPath, [string]$IcoPath) {
   $code = @"
 from PIL import Image
@@ -295,6 +296,7 @@ print("ico-ok", r'''$IcoPath''')
 # ======================================================================================
 # Build com PyInstaller
 # ======================================================================================
+# Build do executável: limpa work/dist, copia fontes e roda PyInstaller.
 function Build-Exe([string]$PyPath, [string]$IconPngPath) {
   # Limpa pasta de trabalho para evitar lixo antigo
   if (Test-Path $WORK_DIR) { Remove-Item $WORK_DIR -Recurse -Force -ErrorAction SilentlyContinue }
@@ -333,6 +335,7 @@ function Build-Exe([string]$PyPath, [string]$IconPngPath) {
 # ======================================================================================
 # Atalhos (.lnk)
 # ======================================================================================
+# Cria .lnk via WScript.Shell (Desktop e Menu Iniciar).
 function Create-Shortcut([string]$ShortcutPath, [string]$TargetPath, [string]$IconIcoPath) {
   $wsh = New-Object -ComObject WScript.Shell
   $s = $wsh.CreateShortcut($ShortcutPath)
@@ -345,6 +348,7 @@ function Create-Shortcut([string]$ShortcutPath, [string]$TargetPath, [string]$Ic
 # ======================================================================================
 # MAIN
 # ======================================================================================
+# Orquestração do fluxo completo com Write-Progress (progresso nativo do PowerShell).
 function Main {
   New-Dirs
   Log "=== Início Setup Windows: $APP_NAME | v$SCRIPT_VERSION ==="

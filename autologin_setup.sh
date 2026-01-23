@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # ======================================================================================
-# autologin_setup.sh
+# autologin_setup.sh — Documentação (v1.1)
+# Autor: Gustavo Pires
+# Data: 2026-01-23
 # Suricato AutoLogin (F12) - Linux Setup/Build
-# Versão: 1.0
+# Versão: 1.1
 # ======================================================================================
 # O que este script faz:
 #   1) Valida pré-requisitos (python3/pip/GUI para seleção de arquivo).
@@ -26,6 +28,7 @@
 #   - Wayland: automação global pode ser limitada. X11 é mais estável.
 # ======================================================================================
 
+# -e: fail-fast | -u: erro em variáveis não definidas | pipefail: falha em pipes.
 set -euo pipefail
 
 VERSION="1.0"
@@ -48,13 +51,16 @@ trap cleanup EXIT
 mkdir -p "$CACHE_DIR"
 : > "$LOG_FILE"
 
+# Logger simples: escreve no arquivo e também mantém registro para auditoria.
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE" >/dev/null; }
 
+# Detecção de GUI: prioriza yad; cai para zenity; se nenhum, usa progresso via terminal.
 has_yad() { command -v yad >/dev/null 2>&1; }
 has_zenity() { command -v zenity >/dev/null 2>&1; }
 has_gui() { has_yad || has_zenity; }
 
 # -------- CLI progress (when no GUI) --------
+# Progresso no terminal quando não há GUI (barra ASCII).
 cli_progress() {
   local percent="$1"
   local msg="${2:-}"
@@ -148,6 +154,7 @@ pick_file() {
 }
 
 # -------- apt installer (best effort) --------
+# Instalação APT “best effort”: tenta instalar e segue mesmo se falhar.
 apt_install_if_missing() {
   local pkg="$1"
 
@@ -214,6 +221,7 @@ apt_missing_any() {
   return 1
 }
 
+# Pré-autenticação sudo: evita pedir senha no meio da barra de progresso.
 ensure_sudo_ticket() {
   # Só faz sentido se:
   #   - não é root
@@ -254,6 +262,7 @@ mkdir -p "$APPS_DIR" "$(dirname "$DESKTOP_FILE")" "$ICON_DIR"
 # >>> NOVO: pede sudo ANTES de abrir progresso (somente se necessário)
 ensure_sudo_ticket
 
+# Fase 1: garante dependências de sistema (APT) e atualiza pip.
 # ---- FASE 1: preparar instalador (com progresso) ----
 (
   echo "5";  echo "# Preparando instalador..."
@@ -313,6 +322,7 @@ if [ ! -f "$ICON_PATH" ]; then ui_error "Ícone não encontrado: $ICON_PATH"; ex
 # Dependências Python usadas/importadas no autologin.py (v1.0)
 REQ_PKGS=(pyautogui pynput cryptography pystray pillow pyinstaller)
 
+# Fase 2: instala deps Python, builda via PyInstaller e cria atalhos.
 # ---- FASE 2: deps python + build + instalar atalhos ----
 (
   echo "5";  echo "# Instalando dependências Python..."

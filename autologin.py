@@ -1,42 +1,66 @@
-# autologin.py
-# ======================================================================================
-# Suricato AutoLogin (F12)
-# Versão: 1.0
-# ======================================================================================
-# IMPORTANTE (promessa de compatibilidade):
-#   - Este arquivo foi APENAS DOCUMENTADO para facilitar manutenção.
-#   - A lógica/fluxo do código original foi preservada (sem mudanças funcionais intencionais).
-#
-# O que este app faz:
-#   - Roda em background com ícone na bandeja (tray icon).
-#   - Ao pressionar F12, preenche usuário/senha na janela atualmente focada:
-#       usuário -> TAB -> senha -> ENTER
-#   - Credenciais ficam em JSON e a senha fica criptografada (Fernet).
-#   - Há um "setup inicial" via GUI:
-#       Linux: tenta YAD, se não tiver tenta Zenity
-#       Windows: Tkinter
-#
-# Pontos de atenção:
-#   - pyautogui.FAILSAFE=True: mover o mouse pro canto superior esquerdo interrompe o pyautogui.
-#   - A "senha mestra" atualmente é derivada com SHA256 direto (sem salt/KDF). Funciona,
-#     mas pode ser reforçado depois (PBKDF2/Argon2) sem mudar UX.
-#   - O listener global de teclado (pynput) é encerrado ao clicar “Sair” no tray.
-#
-# Paths:
-#   - Windows:
-#       Config:  %APPDATA%\SuricatoAutoLogin\autologin.json
-#       Icon:    %APPDATA%\SuricatoAutoLogin\autologin.png  (externo)
-#       Log:     %APPDATA%\SuricatoAutoLogin\autologin.log
-#   - Linux:
-#       Config:  ~/.autologin.json
-#       Icon:    ~/.local/share/icons/autologin.png (externo)
-#       Log:     ~/.cache/autologin/autologin.log
-#
-# Build (PyInstaller):
-#   - O setup empacota autologin.png via --add-data "autologin.png;."
-#   - Em runtime, este app procura primeiro o ícone externo; se não existir,
-#     tenta usar o ícone embutido (PyInstaller _MEIPASS).
-# ======================================================================================
+#!/usr/bin/env python3
+# coding: utf-8
+"""
+autologin.py — Documentação (v1.1)
+Autor: Gustavo Pires
+Data: 2026-01-23
+
+IMPORTANTE
+- Esta versão (v1.1) consolida melhorias de segurança, robustez e UX implementadas.
+- O objetivo é manter o comportamento do app (tray + F12) e elevar a qualidade “profissional”.
+
+Visão geral
+- App residente (system tray) que preenche usuário/senha ao pressionar F12.
+- Credenciais ficam em {"usuario", "senha_enc", "updated_at"} dentro de um JSON.
+- A senha é criptografada com Fernet usando chave derivada de uma “senha mestra”.
+- Um lock impede múltiplas instâncias simultâneas.
+- No Linux usa ~/.config/suricato_autologin; no Windows usa %APPDATA%\\SuricatoAutoLogin.
+
+Manutenção rápida
+- Ponto de entrada: main()
+- Setup/Login: perform_login_or_setup()
+- Captura de tecla: start_keyboard_listener() + type_credentials()
+- Tray/menus: run_tray_icon() + show_about()
+- Single instance: SingleInstanceGuard + acquire_single_instance_or_exit()
+- Criptografia: save_credentials() / load_credentials()
+
+============================================================
+Changelog / Melhorias implementadas nesta v1.1 (consolidado)
+============================================================
+
+1) Instância única (robusto e sólido)
+- Windows: adicionada barreira por Named Mutex (CreateMutexW) + lockfile.
+- Linux: lockfile com fcntl.flock (LOCK_EX | LOCK_NB).
+- Mantém handle aberto e libera em atexit + tentativa extra via signal handlers (Linux).
+
+2) UX / Foco nos dialogs (setup/login)
+- Corrigido “perder foco” ao digitar usuário/senha/senha mestra:
+  - Tkinter com: topmost + lift + focus_force + grab_set (modal)
+  - Reforço via after() e recuperação em FocusOut com throttle
+- No Linux, flags melhores para yad: --center --on-top --focus
+
+3) GUI cross-platform (mais resiliente)
+- Linux: preferir yad; se não existir, usar zenity; fallback Tkinter.
+- Mensagens e inputs passam por wrappers gui_info/gui_error/gui_entry/gui_password.
+
+4) Persistência mais segura e confiavel.
+- Escrita atômica do JSON (arquivo .tmp + os.replace).
+- chmod 600 no Linux (quando possível), reduz exposição do arquivo.
+
+5) Criptografia fortalecida (compatível com legado)
+- Novo formato: PBKDF2-HMAC-SHA256 (salt + iterations) -> Fernet.
+- Compatibilidade: se config antigo não tiver kdf/salt/iterations, usa modo legado SHA256 direto.
+
+6) “Sobre” mais profissional
+- Mostra ícone + Nome + Versão + Autor (Gustavo Pires) + atalho F12.
+- Linux: yad com --image quando possível; fallback Tkinter com imagem.
+
+7) Encerramento limpo
+- “Sair” para listener imediatamente e para o ícone tray.
+- Handlers SIGINT/SIGTERM/SIGHUP no Linux para reduzir travas em encerramentos.
+
+============================================================
+"""
 
 import os
 import sys
@@ -45,170 +69,83 @@ import time
 import threading
 import base64
 import hashlib
-import subprocess
 import platform
+import atexit
+import logging
+import subprocess
+import signal
 from pathlib import Path
+from typing import Optional, Tuple
 
+# Dependências externas
 import pyautogui
 from pynput import keyboard
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 import pystray
 from PIL import Image
 
-# ---------------- VERSION ----------------
-__version__ = "1.0"
-# ----------------------------------------
-
-
-# ---------------- CONFIG (constantes do app) ----------------
-# Nome amigável e "slug" (usado em paths no Windows)
+# ---------------- CONSTANTES E CONFIGURAÇÕES ----------------
 APP_NAME = "Suricato AutoLogin"
 APP_SLUG = "SuricatoAutoLogin"
-
-# Cooldown para impedir múltiplos disparos em sequência (ex.: tecla repetindo)
+APP_AUTHOR = "Gustavo Pires"
+__version__ = "1.1"
 COOLDOWN_S = 1.5
 
-# Segurança do pyautogui:
-# Se o mouse for movido para o canto superior esquerdo, pyautogui aborta ações.
 pyautogui.FAILSAFE = True
 
-# Controle do último disparo do F12 (para aplicar cooldown)
-_ultimo_disparo = 0.0
+_stop_event = threading.Event()
+_listener = None
+_last_trigger_time = 0.0
 
-# Usamos Event para encerramento limpo (threads consultam esse estado)
-stop_event = threading.Event()
-
-# Referência global do listener (para parar imediatamente no menu “Sair”)
+# Para parar listener imediatamente
 _listener_ref = {"listener": None}
-# -----------------------------------------------------------
 
-
-# ---------------- LOG (debug/forense) ----------------
-def get_log_path() -> Path:
-    """Define o caminho do log conforme o sistema operacional.
-
-    Windows:
-      %APPDATA%\SuricatoAutoLogin\autologin.log
-
-    Linux:
-      ~/.cache/autologin/autologin.log
-    """
-    if platform.system().lower().startswith("win"):
-        appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-        base = Path(appdata) / APP_SLUG
-    else:
-        base = Path.home() / ".cache" / "autologin"
-    base.mkdir(parents=True, exist_ok=True)
-    return base / "autologin.log"
-
-
-LOG_PATH = get_log_path()
-
-
-def log(msg: str):
-    """Log simples em arquivo (append).
-
-    Observação:
-      - Mantém o arquivo de log como texto UTF-8.
-      - Qualquer falha de IO é silenciosa (não interrompe o app).
-    """
-    try:
-        LOG_PATH.write_text(
-            (LOG_PATH.read_text(encoding="utf-8") if LOG_PATH.exists() else "")
-            + f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n",
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
-# -----------------------------------------------------
-
-
-# ---------------- OS DETECTION ----------------
-def get_os() -> str:
-    """Retorna uma string simplificada do sistema operacional."""
-    s = platform.system().lower()
-    if "windows" in s:
-        return "windows"
-    if "linux" in s:
-        return "linux"
-    if "darwin" in s or "mac" in s:
-        return "mac"
-    return "other"
-
-
+# ---------------- SISTEMA DE LOGS E PATHS ----------------
 def is_windows() -> bool:
-    """Atalho para checagem do OS."""
-    return get_os() == "windows"
+    return platform.system().lower().startswith("win")
 
 
 def is_linux() -> bool:
-    """Atalho para checagem do OS."""
-    return get_os() == "linux"
-# ---------------------------------------------
+    return platform.system().lower().startswith("linux")
 
 
-# ---------------- PATHS (cross-platform) ----------------
-def get_config_path() -> Path:
-    """Retorna o caminho do arquivo de configuração/credenciais.
-
-    Linux:
-      ~/.autologin.json
-
-    Windows:
-      %APPDATA%\SuricatoAutoLogin\autologin.json
-    """
+def get_base_dir() -> Path:
     if is_windows():
         appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
         base = Path(appdata) / APP_SLUG
-        base.mkdir(parents=True, exist_ok=True)
-        return base / "autologin.json"
     else:
-        return Path.home() / ".autologin.json"
+        base = Path.home() / ".config" / "suricato_autologin"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+BASE_DIR = get_base_dir()
+CONFIG_FILE = BASE_DIR / "autologin.json"
+LOCK_FILE = BASE_DIR / "autologin.lock"
+LOG_FILE = BASE_DIR / "autologin.log"
+
+logging.basicConfig(
+    filename=str(LOG_FILE),
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    encoding="utf-8",
+)
+
+# ---------------- EMPACOTAMENTO (PyInstaller) ----------------
+def resource_path(relative_path: str) -> str:
+    base_path = getattr(sys, "_MEIPASS", os.path.abspath("."))
+    return os.path.join(base_path, relative_path)
 
 
 def get_external_icon_path() -> Path:
-    """Retorna o caminho do ícone externo (fora do executável).
-
-    Linux:
-      ~/.local/share/icons/autologin.png
-
-    Windows:
-      %APPDATA%\SuricatoAutoLogin\autologin.png
-    """
-    if is_windows():
-        cfg_dir = get_config_path().parent
-        return cfg_dir / "autologin.png"
-    else:
-        return Path.home() / ".local" / "share" / "icons" / "autologin.png"
+    return BASE_DIR / "autologin.png"
 
 
-CONFIG_PATH = get_config_path()
 ICON_EXTERNAL_PATH = get_external_icon_path()
-
-# Nome do ícone embutido no build (PyInstaller --add-data "autologin.png;.")
 ICON_EMBED_NAME = "autologin.png"
-# --------------------------------------------------------
-
-
-# ---------------- RESOURCE PATH (PyInstaller) ----------------
-def resource_path(relative_path: str) -> str:
-    """Resolve caminho de arquivo tanto em execução normal quanto empacotado (PyInstaller).
-
-    PyInstaller:
-      - disponibiliza sys._MEIPASS como base temporária para recursos empacotados.
-    """
-    base = getattr(sys, "_MEIPASS", os.path.abspath("."))
-    return os.path.join(base, relative_path)
 
 
 def get_icon_path() -> str:
-    """Escolhe o melhor ícone disponível.
-
-    Prioridade:
-      1) ícone externo (por OS)
-      2) ícone embutido no executável (autologin.png via PyInstaller)
-      3) vazio -> caller decide um fallback (imagem cinza)
-    """
     if ICON_EXTERNAL_PATH.exists():
         return str(ICON_EXTERNAL_PATH)
 
@@ -217,30 +154,35 @@ def get_icon_path() -> str:
         return embedded
 
     return ""
-# --------------------------------------------------------------
 
 
-# ---------------- GUI HELPERS ----------------
+def load_icon_image() -> Image.Image:
+    icon_path = get_icon_path()
+    if not icon_path:
+        return Image.new("RGBA", (64, 64), (40, 40, 40, 255))
+    try:
+        img = Image.open(icon_path).convert("RGBA").resize((64, 64))
+        return img
+    except Exception:
+        return Image.new("RGBA", (64, 64), (40, 40, 40, 255))
+
+
+# ---------------- GUI (Linux: yad/zenity -> Windows: tkinter) ----------------
 def _has_cmd(cmd: str) -> bool:
-    """Checa se um comando existe no PATH (Linux)."""
     from shutil import which
     return which(cmd) is not None
 
 
-def _tk_init():
-    """Inicializa Tk em modo 'sem janela principal' e sempre no topo (Windows)."""
+def _tk_message(kind: str, title: str, msg: str):
     import tkinter as tk
+    import tkinter.messagebox as mb
+
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    return root
-
-
-def _tk_message(kind: str, title: str, msg: str):
-    """Mostra MessageBox via Tkinter."""
-    import tkinter.messagebox as mb
-    root = _tk_init()
     try:
+        root.lift()
+        root.focus_force()
         if kind == "error":
             mb.showerror(title, msg, parent=root)
         else:
@@ -252,36 +194,54 @@ def _tk_message(kind: str, title: str, msg: str):
             pass
 
 
-def _tk_entry(title: str, text: str, label: str = "Texto", password: bool = False) -> str | None:
-    """Janela de input via Tkinter (Windows), com suporte a campo de senha."""
+def _tk_entry(title: str, text: str, label: str, password: bool = False) -> Optional[str]:
+    """
+    Dialog modal com foco “teimoso”:
+    - topmost + lift + focus_force
+    - grab_set() para impedir clique fora
+    - reforço de foco via after()
+    - recuperação em FocusOut (com throttle)
+    """
     import tkinter as tk
 
     root = tk.Tk()
     root.title(title)
-    root.attributes("-topmost", True)
     root.resizable(False, False)
 
-    val = {"result": None}
+    root.attributes("-topmost", True)
+    root.lift()
+    root.focus_force()
+
+    try:
+        root.update_idletasks()
+        w, h = 440, 180
+        x = (root.winfo_screenwidth() // 2) - (w // 2)
+        y = (root.winfo_screenheight() // 2) - (h // 2)
+        root.geometry(f"{w}x{h}+{x}+{y}")
+    except Exception:
+        pass
+
+    result = {"value": None}
+    focus_guard = {"last": 0.0}
 
     frm = tk.Frame(root, padx=12, pady=12)
-    frm.pack()
+    frm.pack(fill="both", expand=True)
 
     tk.Label(frm, text=text, justify="left").pack(anchor="w")
     tk.Label(frm, text=label).pack(anchor="w", pady=(10, 2))
 
-    entry = tk.Entry(frm, width=40, show="*" if password else "")
-    entry.pack(anchor="w")
-    entry.focus_set()
+    entry = tk.Entry(frm, width=48, show="*" if password else "")
+    entry.pack(anchor="w", fill="x")
 
     btns = tk.Frame(frm, pady=12)
     btns.pack(fill="x")
 
     def ok():
-        val["result"] = entry.get()
+        result["value"] = entry.get()
         root.destroy()
 
     def cancel():
-        val["result"] = None
+        result["value"] = None
         root.destroy()
 
     tk.Button(btns, text="OK", width=10, command=ok).pack(side="right", padx=(6, 0))
@@ -289,292 +249,472 @@ def _tk_entry(title: str, text: str, label: str = "Texto", password: bool = Fals
 
     root.bind("<Return>", lambda _: ok())
     root.protocol("WM_DELETE_WINDOW", cancel)
+
+    try:
+        root.grab_set()
+    except Exception:
+        pass
+
+    def force_focus():
+        try:
+            root.lift()
+            root.attributes("-topmost", True)
+            root.focus_force()
+            entry.focus_set()
+            entry.icursor("end")
+            root.after(50, lambda: root.attributes("-topmost", False))
+            root.after(100, lambda: root.attributes("-topmost", True))
+        except Exception:
+            pass
+
+    root.after(0, force_focus)
+    root.after(200, force_focus)
+
+    def on_focus_out(_evt=None):
+        now = time.time()
+        if now - focus_guard["last"] < 0.25:
+            return
+        focus_guard["last"] = now
+        root.after(50, force_focus)
+
+    root.bind("<FocusOut>", on_focus_out)
+
     root.mainloop()
-    return val["result"]
+    return result["value"]
 
 
-def gui_entry(title: str, text: str, field_label: str = "Texto") -> str | None:
-    """Entrada de texto (usuário).
+def gui_info(msg: str):
+    if is_linux() and _has_cmd("yad"):
+        subprocess.run(
+            ["yad", "--info", "--title=AutoLogin", "--center", "--on-top", "--focus", f"--text={msg}"],
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    if is_linux() and _has_cmd("zenity"):
+        subprocess.run(
+            ["zenity", "--info", "--title=AutoLogin", "--text", msg],
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    _tk_message("info", "AutoLogin", msg)
 
-    Linux:
-      tenta YAD -> Zenity
 
-    Windows:
-      Tkinter
-    """
+def gui_error(msg: str):
+    if is_linux() and _has_cmd("yad"):
+        subprocess.run(
+            ["yad", "--error", "--title=AutoLogin", "--center", "--on-top", "--focus", f"--text={msg}"],
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    if is_linux() and _has_cmd("zenity"):
+        subprocess.run(
+            ["zenity", "--error", "--title=AutoLogin", "--text", msg],
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    _tk_message("error", "AutoLogin", msg)
+
+
+def gui_entry(title: str, text: str, field_label: str = "Texto") -> Optional[str]:
     if is_linux():
         if _has_cmd("yad"):
             p = subprocess.run(
-                ["yad", "--form", f"--title={title}", f"--text={text}",
-                 "--separator=", f"--field={field_label}:", "--button=OK:0", "--button=Cancelar:1"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                [
+                    "yad",
+                    "--form",
+                    "--center",
+                    "--on-top",
+                    "--focus",
+                    f"--title={title}",
+                    f"--text={text}",
+                    "--separator=",
+                    f"--field={field_label}:",
+                    "--button=OK:0",
+                    "--button=Cancelar:1",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
             )
             return None if p.returncode != 0 else p.stdout.strip()
 
         if _has_cmd("zenity"):
             p = subprocess.run(
                 ["zenity", "--entry", f"--title={title}", f"--text={text}"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
             )
             return None if p.returncode != 0 else p.stdout.rstrip("\n")
 
     return _tk_entry(title, text, label=field_label, password=False)
 
 
-def gui_password(title: str, text: str, label: str = "Senha") -> str | None:
-    """Entrada de senha (campo mascarado).
-
-    Linux:
-      - YAD: permite label custom (e campo hidden via :H)
-      - Zenity: label não custom (usa título/texto)
-
-    Windows:
-      Tkinter (label custom)
-    """
+def gui_password(title: str, text: str, label: str = "Senha") -> Optional[str]:
     if is_linux():
         if _has_cmd("yad"):
             p = subprocess.run(
-                ["yad", "--form", f"--title={title}", f"--text={text}",
-                 "--separator=", f"--field={label}:H", "--button=OK:0", "--button=Cancelar:1"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                [
+                    "yad",
+                    "--form",
+                    "--center",
+                    "--on-top",
+                    "--focus",
+                    f"--title={title}",
+                    f"--text={text}",
+                    "--separator=",
+                    f"--field={label}:H",
+                    "--button=OK:0",
+                    "--button=Cancelar:1",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
             )
             return None if p.returncode != 0 else p.stdout.strip()
 
         if _has_cmd("zenity"):
             p = subprocess.run(
                 ["zenity", "--password", f"--title={title}", f"--text={text}"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
             )
             return None if p.returncode != 0 else p.stdout.rstrip("\n")
 
     return _tk_entry(title, text, label=label, password=True)
 
 
-def gui_error(msg: str):
-    """Mensagem de erro cross-platform."""
-    if is_linux() and _has_cmd("yad"):
-        subprocess.run(["yad", "--error", "--title=AutoLogin", f"--text={msg}"], stderr=subprocess.DEVNULL)
-        return
-    if is_linux() and _has_cmd("zenity"):
-        subprocess.run(["zenity", "--error", "--title=AutoLogin", f"--text={msg}"], stderr=subprocess.DEVNULL)
-        return
-    _tk_message("error", "AutoLogin", msg)
-
-
-def gui_info(msg: str):
-    """Mensagem informativa cross-platform."""
-    if is_linux() and _has_cmd("yad"):
-        subprocess.run(["yad", "--info", "--title=AutoLogin", f"--text={msg}"], stderr=subprocess.DEVNULL)
-        return
-    if is_linux() and _has_cmd("zenity"):
-        subprocess.run(["zenity", "--info", "--title=AutoLogin", f"--text={msg}"], stderr=subprocess.DEVNULL)
-        return
-    _tk_message("info", "AutoLogin", msg)
-# --------------------------------------------------
-
-
-# ---------------- CRIPTOGRAFIA ----------------
-def derive_key(master_password: str) -> bytes:
-    """Deriva uma chave Fernet a partir da senha mestra.
-
-    Nota:
-      - SHA256 direto (sem salt/KDF) foi mantido para preservar a compatibilidade v1.0.
-      - Melhoria futura (sem mudar UX): PBKDF2/Argon2 + salt salvo no config.
+# ---------------- SINGLE INSTANCE (robusto) ----------------
+class SingleInstanceGuard:
     """
+    Instância única:
+    - Windows: Named Mutex (CreateMutexW) + lockfile (msvcrt)
+    - Linux: lockfile (fcntl.flock)
+    """
+
+    def __init__(self, lock_file: Path, mutex_name: str):
+        self.lock_file = lock_file
+        self.mutex_name = mutex_name
+        self._fh = None
+        self._mutex_handle = None
+
+    def acquire_or_exit(self, on_already_running):
+        if is_windows():
+            if not self._acquire_windows_mutex():
+                on_already_running()
+                raise SystemExit(0)
+
+        if not self._acquire_file_lock():
+            on_already_running()
+            raise SystemExit(0)
+
+        atexit.register(self.release)
+
+    def _acquire_windows_mutex(self) -> bool:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+            CreateMutexW = kernel32.CreateMutexW
+            CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+            CreateMutexW.restype = wintypes.HANDLE
+
+            GetLastError = kernel32.GetLastError
+            GetLastError.argtypes = ()
+            GetLastError.restype = wintypes.DWORD
+
+            ERROR_ALREADY_EXISTS = 183
+
+            handle = CreateMutexW(None, False, self.mutex_name)
+            if not handle:
+                return True
+
+            last_err = GetLastError()
+            if last_err == ERROR_ALREADY_EXISTS:
+                try:
+                    kernel32.CloseHandle(handle)
+                except Exception:
+                    pass
+                return False
+
+            self._mutex_handle = handle
+            return True
+
+        except Exception as e:
+            logging.warning(f"Mutex Windows indisponível (fallback lockfile): {e!r}")
+            return True
+
+    def _acquire_file_lock(self) -> bool:
+        try:
+            self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(self.lock_file, "a+b")
+
+            if is_windows():
+                import msvcrt
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            return True
+
+        except (IOError, BlockingIOError, PermissionError):
+            return False
+        except Exception as e:
+            logging.error(f"Falha ao adquirir lockfile: {e!r}")
+            return False
+
+    def release(self):
+        try:
+            if self._fh:
+                self._fh.close()
+        except Exception:
+            pass
+
+        if self._mutex_handle:
+            try:
+                import ctypes
+                ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(self._mutex_handle)
+            except Exception:
+                pass
+
+
+_singleton = {"guard": None}
+
+
+def acquire_single_instance_or_exit():
+    mutex_name = r"Local\SuricatoAutoLogin.Singleton"
+    guard = SingleInstanceGuard(LOCK_FILE, mutex_name)
+    guard.acquire_or_exit(
+        on_already_running=lambda: gui_info(
+            "O Suricato AutoLogin já está rodando!\nVerifique o ícone perto do relógio."
+        )
+    )
+    _singleton["guard"] = guard
+
+
+def _setup_signal_handlers():
+    if is_windows():
+        return
+
+    def _handle_sig(_signum, _frame):
+        try:
+            _stop_event.set()
+            lst = _listener_ref.get("listener")
+            if lst is not None:
+                lst.stop()
+        except Exception:
+            pass
+        try:
+            g = _singleton.get("guard")
+            if g:
+                g.release()
+        except Exception:
+            pass
+        raise SystemExit(0)
+
+    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(s, _handle_sig)
+        except Exception:
+            pass
+
+
+# ---------------- CRIPTOGRAFIA E DADOS ----------------
+def _derive_key_legacy_sha256(master_password: str) -> bytes:
     digest = hashlib.sha256(master_password.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest)
 
 
-def save_credentials(usuario: str, senha: str, master: str):
-    """Salva o usuário e senha criptografada em JSON no CONFIG_PATH."""
-    fernet = Fernet(derive_key(master))
-    data = {
-        "usuario": usuario,
-        "senha_enc": fernet.encrypt(senha.encode("utf-8")).decode("utf-8"),
-    }
+def _derive_key_pbkdf2(master_password: str, salt_b64: str, iterations: int) -> bytes:
+    salt = base64.urlsafe_b64decode(salt_b64.encode("ascii"))
+    dk = hashlib.pbkdf2_hmac("sha256", master_password.encode("utf-8"), salt, iterations, dklen=32)
+    return base64.urlsafe_b64encode(dk)
 
-    cfg_path = CONFIG_PATH
-    cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    cfg_path.write_text(json.dumps(data), encoding="utf-8")
 
-    # No Linux, ajuda a restringir permissões. No Windows, chmod não tem efeito real.
+def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8"):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding=encoding)
+    os.replace(str(tmp), str(path))
+
+
+def save_credentials(user: str, password: str, master: str):
     try:
-        os.chmod(str(cfg_path), 0o600)
-    except Exception:
-        pass
+        salt = os.urandom(16)
+        salt_b64 = base64.urlsafe_b64encode(salt).decode("ascii")
+        iterations = 200_000
 
+        fernet = Fernet(_derive_key_pbkdf2(master, salt_b64, iterations))
+        data = {
+            "schema_version": 2,
+            "kdf": "pbkdf2_sha256",
+            "iterations": iterations,
+            "salt": salt_b64,
+            "usuario": user,
+            "senha_enc": fernet.encrypt(password.encode("utf-8")).decode("utf-8"),
+            "updated_at": time.time(),
+        }
 
-def load_credentials(master: str):
-    """Carrega credenciais do JSON e descriptografa a senha usando a senha mestra."""
-    data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    fernet = Fernet(derive_key(master))
-    try:
-        senha = fernet.decrypt(data["senha_enc"].encode("utf-8")).decode("utf-8")
-    except Exception:
-        raise ValueError("Senha mestra incorreta (ou arquivo corrompido).")
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(CONFIG_FILE, json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
-    usuario = data.get("usuario")
-    if not usuario or not senha:
-        raise ValueError("Arquivo de credenciais incompleto.")
-    return usuario, senha
-# ---------------------------------------------
+        try:
+            os.chmod(str(CONFIG_FILE), 0o600)
+        except Exception:
+            pass
 
-
-# ---------------- SETUP (GUI) ----------------
-def first_setup_gui():
-    """Fluxo de primeiro uso: coleta usuário/senha e cria senha mestra."""
-    usuario = gui_entry("AutoLogin", "Digite seu usuário:", field_label="Usuário")
-    if usuario is None:
-        sys.exit(0)
-
-    senha = gui_password("AutoLogin", "Digite sua senha:", label="Senha")
-    if senha is None:
-        sys.exit(0)
-
-    master1 = gui_password("AutoLogin", "Crie uma senha mestra:", label="Senha mestra")
-    if master1 is None:
-        sys.exit(0)
-
-    master2 = gui_password("AutoLogin", "Repita a senha mestra:", label="Senha mestra (repetir)")
-    if master2 is None:
-        sys.exit(0)
-
-    usuario = usuario.strip()
-    senha = senha.strip()
-
-    if not usuario or not senha:
-        gui_error("Usuário ou senha vazios.")
-        sys.exit(1)
-
-    if not master1 or master1 != master2:
-        gui_error("Senha mestra não confere.")
-        sys.exit(1)
-
-    save_credentials(usuario, senha, master1)
-    gui_info("Credenciais salvas com sucesso.")
-    return usuario, senha
-
-
-def load_or_setup():
-    """Carrega credenciais existentes ou executa o setup inicial se não existir config."""
-    if not CONFIG_PATH.exists():
-        return first_setup_gui()
-
-    master = gui_password("AutoLogin", "Digite sua senha mestra:", label="Senha mestra")
-    if master is None or not master:
-        sys.exit(0)
-
-    try:
-        return load_credentials(master)
     except Exception as e:
-        gui_error(str(e))
-        sys.exit(1)
-# ---------------------------------------------
+        gui_error(f"Falha ao salvar: {e}")
 
 
-# ---------------- AUTOFILL ----------------
-def preencher_login(usuario: str, senha: str):
-    """Executa o preenchimento via pyautogui na janela em foco."""
-    # Pequeno delay para o usuário focar no campo correto
-    time.sleep(0.15)
-    pyautogui.write(usuario, interval=0.03)
-    pyautogui.press("tab")
-    pyautogui.write(senha, interval=0.03)
-    pyautogui.press("enter")
+def load_credentials(master: str) -> Tuple[str, str]:
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+
+        usuario = data.get("usuario")
+        senha_enc = data.get("senha_enc")
+        if not usuario or not senha_enc:
+            raise ValueError("Arquivo de credenciais incompleto.")
+
+        kdf = data.get("kdf")
+        if kdf == "pbkdf2_sha256" and data.get("salt") and data.get("iterations"):
+            key = _derive_key_pbkdf2(master, data["salt"], int(data["iterations"]))
+        else:
+            key = _derive_key_legacy_sha256(master)
+
+        fernet = Fernet(key)
+        senha = fernet.decrypt(senha_enc.encode("utf-8")).decode("utf-8")
+        return usuario, senha
+
+    except (InvalidToken, ValueError):
+        raise ValueError("Senha incorreta.")
+    except Exception as e:
+        logging.error(f"Erro ao carregar credenciais: {e!r}")
+        raise ValueError("Falha ao ler credenciais (arquivo inválido/corrompido).")
 
 
-def keyboard_listener(usuario: str, senha: str):
-    """Listener global de teclado (pynput).
+# ---------------- SETUP ----------------
+def perform_login_or_setup() -> Tuple[str, str]:
+    if not CONFIG_FILE.exists():
+        u = gui_entry("Setup", "Digite o USUÁRIO:", field_label="Usuário")
+        if not u:
+            sys.exit(0)
 
-    Responsabilidades:
-      - Capturar F12
-      - Aplicar cooldown (COOLDOWN_S) para evitar duplicidade
-      - Encerrar limpo quando stop_event for setado
-    """
-    global _ultimo_disparo
+        p = gui_password("Setup", "Digite a SENHA:", label="Senha")
+        if not p:
+            sys.exit(0)
+
+        m1 = gui_password("Segurança", "Crie uma SENHA MESTRA:", label="Senha mestra")
+        if not m1:
+            sys.exit(0)
+
+        m2 = gui_password("Segurança", "Repita a SENHA MESTRA:", label="Senha mestra (repetir)")
+        if not m2:
+            sys.exit(0)
+
+        u = u.strip()
+        p = p.strip()
+
+        if not u or not p:
+            gui_error("Usuário ou senha vazios.")
+            sys.exit(1)
+
+        if m1 != m2:
+            gui_error("Senhas mestras não coincidem.")
+            sys.exit(1)
+
+        save_credentials(u, p, m1)
+        gui_info("Configurado! Verifique o ícone na bandeja.")
+        return u, p
+
+    attempts = 0
+    while attempts < 3:
+        m = gui_password("Login", "Senha Mestra:", label="Senha mestra")
+        if not m:
+            sys.exit(0)
+        try:
+            return load_credentials(m)
+        except ValueError:
+            attempts += 1
+            gui_error(f"Senha incorreta ({attempts}/3)")
+    sys.exit(1)
+
+
+# ---------------- AUTOMAÇÃO (F12) ----------------
+def type_credentials(user: str, password: str):
+    try:
+        time.sleep(0.10)
+        pyautogui.write(user, interval=0.02)
+        pyautogui.press("tab")
+        pyautogui.write(password, interval=0.02)
+        pyautogui.press("enter")
+    except pyautogui.FailSafeException:
+        logging.warning("FailSafe acionado (mouse no canto superior esquerdo).")
+    except Exception as e:
+        logging.error(f"Erro ao digitar credenciais: {e!r}")
+
+
+def start_keyboard_listener(user: str, password: str):
+    global _listener
 
     def on_press(key):
-        global _ultimo_disparo
-
-        # Se solicitar parada, encerramos o listener (retornando False).
-        if stop_event.is_set():
+        global _last_trigger_time
+        if _stop_event.is_set():
             return False
 
-        # Hotkey
         if key == keyboard.Key.f12:
-            agora = time.time()
-            if agora - _ultimo_disparo >= COOLDOWN_S:
-                _ultimo_disparo = agora
-                try:
-                    preencher_login(usuario, senha)
-                except Exception as e:
-                    log(f"Erro ao preencher_login: {e!r}")
+            now = time.time()
+            if now - _last_trigger_time > COOLDOWN_S:
+                _last_trigger_time = now
+                threading.Thread(target=type_credentials, args=(user, password), daemon=True).start()
 
-    listener = keyboard.Listener(on_press=on_press)
-    _listener_ref["listener"] = listener
-    listener.start()
-    listener.join()
-# -----------------------------------------
+    _listener = keyboard.Listener(on_press=on_press)
+    _listener_ref["listener"] = _listener
+    _listener.start()
 
 
-# ---------------- TRAY ICON ----------------
-def load_icon_image() -> Image.Image:
-    """Carrega o ícone (externo -> embutido -> fallback cinza)."""
-    icon_path = get_icon_path()
-    if not icon_path:
-        return Image.new("RGBA", (64, 64), (40, 40, 40, 255))
-
-    img = Image.open(icon_path).convert("RGBA")
-    img = img.resize((64, 64))
-    return img
-
-
-# ---------------- ABOUT (menu "Sobre") ----------------
+# ---------------- BANDEJA (TRAY) ----------------
 def show_about():
-    """Exibe a janela 'Sobre' com ícone e versão do aplicativo.
-
-    Objetivo:
-      - Disponibilizar no tray um menu 'Sobre' com informações básicas do app.
-      - Mostrar o ícone e a versão (__version__) para facilitar suporte/manutenção.
-
-    Implementação por OS:
-      - Linux: tenta YAD (com imagem) -> Zenity (sem imagem)
-      - Windows: Tkinter (com imagem, usando ImageTk)
-      - Fallback: se algo falhar, registra no log e não derruba o app
-    """
-
     title = "Sobre - Suricato AutoLogin"
-    text = f"{APP_NAME}\nVersão {__version__}\n\nAutoLogin via tecla F12"
+    text_plain = (
+        f"{APP_NAME}\n"
+        f"Versão {__version__}\n"
+        f"Autor: {APP_AUTHOR}\n\n"
+        "Atalho: F12 (preenche usuário/senha)\n"
+    )
 
-    # Linux: preferimos YAD (aceita imagem); se não houver, usamos Zenity.
     if is_linux():
         if _has_cmd("yad"):
             try:
-                subprocess.run(
-                    [
-                        "yad",
-                        "--title", title,
-                        "--text", text,
-                        "--image", get_icon_path(),
-                        "--button=OK:0",
-                    ],
-                    stderr=subprocess.DEVNULL,
-                )
+                iconp = get_icon_path()
+                args = [
+                    "yad",
+                    "--title", title,
+                    "--center",
+                    "--on-top",
+                    "--focus",
+                    "--button=OK:0",
+                    "--text", text_plain,
+                ]
+                if iconp:
+                    args += ["--image", iconp]
+                subprocess.run(args, stderr=subprocess.DEVNULL)
                 return
             except Exception as e:
-                log(f"Falha ao abrir 'Sobre' via yad: {e!r}")
+                logging.error(f"Falha ao abrir 'Sobre' via yad: {e!r}")
 
         if _has_cmd("zenity"):
             try:
-                subprocess.run(
-                    ["zenity", "--info", "--title", title, "--text", text],
-                    stderr=subprocess.DEVNULL,
-                )
+                subprocess.run(["zenity", "--info", "--title", title, "--text", text_plain], stderr=subprocess.DEVNULL)
                 return
             except Exception as e:
-                log(f"Falha ao abrir 'Sobre' via zenity: {e!r}")
+                logging.error(f"Falha ao abrir 'Sobre' via zenity: {e!r}")
 
-    # Windows (e fallback geral): Tkinter com imagem (se disponível)
+    # Fallback Tk (com ícone e layout)
     try:
         import tkinter as tk
         from tkinter import ttk
@@ -585,97 +725,132 @@ def show_about():
         root.attributes("-topmost", True)
         root.resizable(False, False)
 
-        frame = ttk.Frame(root, padding=12)
+        frame = ttk.Frame(root, padding=14)
         frame.pack()
 
-        # Carrega ícone (externo/embutido) e mostra na janela.
         icon_path = get_icon_path()
         if icon_path and os.path.exists(icon_path):
             img = Image.open(icon_path).convert("RGBA").resize((64, 64))
             photo = ImageTk.PhotoImage(img)
             lbl_img = ttk.Label(frame, image=photo)
-            lbl_img.image = photo  # evita garbage collection
-            lbl_img.pack(pady=(0, 8))
+            lbl_img.image = photo
+            lbl_img.grid(row=0, column=0, rowspan=4, padx=(0, 12), pady=(2, 2))
 
-        ttk.Label(frame, text=APP_NAME, font=("Segoe UI", 11, "bold")).pack()
-        ttk.Label(frame, text=f"Versão {__version__}").pack(pady=(4, 0))
-        ttk.Label(frame, text="AutoLogin via tecla F12").pack(pady=(6, 10))
-        ttk.Button(frame, text="OK", command=root.destroy).pack()
+        ttk.Label(frame, text=APP_NAME, font=("Segoe UI", 12, "bold")).grid(row=0, column=1, sticky="w")
+        ttk.Label(frame, text=f"Versão {__version__}").grid(row=1, column=1, sticky="w", pady=(4, 0))
+        ttk.Label(frame, text=f"Autor: {APP_AUTHOR}").grid(row=2, column=1, sticky="w", pady=(4, 0))
+        ttk.Label(frame, text="Atalho: F12 (preenche usuário/senha)").grid(row=3, column=1, sticky="w", pady=(10, 0))
+
+        ttk.Separator(frame, orient="horizontal").grid(row=4, column=0, columnspan=2, sticky="ew", pady=12)
+        ttk.Button(frame, text="OK", command=root.destroy).grid(row=5, column=0, columnspan=2)
+
+        try:
+            root.grab_set()
+        except Exception:
+            pass
+        root.lift()
+        root.focus_force()
 
         root.mainloop()
     except Exception as e:
-        # Não derruba o app em caso de erro de GUI
-        log(f"Falha ao abrir 'Sobre' (fallback Tkinter): {e!r}")
-# ------------------------------------------------------
+        logging.error(f"Falha ao abrir 'Sobre' (fallback Tkinter): {e!r}")
+        gui_info(text_plain)
 
 
+def run_tray_icon(user: str, password: str):
+    def open_about(icon, item):
+        threading.Thread(target=show_about, daemon=True).start()
 
-def tray_app():
-    """Inicializa o ícone na bandeja e o menu (Resetar / Sair).
+    def open_reset(icon, item):
+        def _reset_logic():
+            confirmed = False
+            if is_linux() and _has_cmd("yad"):
+                p = subprocess.run(
+                    [
+                        "yad",
+                        "--question",
+                        "--title=Resetar",
+                        "--text=Deseja apagar as credenciais e fechar?",
+                        "--button=Sim:0",
+                        "--button=Não:1",
+                        "--center",
+                        "--on-top",
+                        "--focus",
+                    ],
+                    stderr=subprocess.DEVNULL,
+                )
+                confirmed = (p.returncode == 0)
+            elif is_linux() and _has_cmd("zenity"):
+                p = subprocess.run(
+                    ["zenity", "--question", "--title=Resetar", "--text=Deseja apagar as credenciais e fechar?"],
+                    stderr=subprocess.DEVNULL,
+                )
+                confirmed = (p.returncode == 0)
+            else:
+                try:
+                    import tkinter as tk
+                    from tkinter import messagebox
+                    r = tk.Tk()
+                    r.withdraw()
+                    r.attributes("-topmost", True)
+                    r.lift()
+                    r.focus_force()
+                    confirmed = messagebox.askyesno("Resetar", "Deseja apagar as credenciais e fechar?", parent=r)
+                    r.destroy()
+                except Exception:
+                    confirmed = False
 
-    Observação importante:
-      - Ao clicar “Sair”, paramos o listener imediatamente chamando listener.stop().
-        Isso evita esperar a próxima tecla para encerrar.
-    """
+            if confirmed:
+                try:
+                    if CONFIG_FILE.exists():
+                        os.remove(str(CONFIG_FILE))
+                    gui_info("Credenciais apagadas.")
+                except Exception as e:
+                    logging.error(f"Erro removendo config: {e!r}")
+                    gui_error("Não foi possível remover o arquivo de credenciais.")
+                on_exit(icon, item)
 
-    def sair(icon, item):
-        stop_event.set()
+        threading.Thread(target=_reset_logic, daemon=True).start()
 
-        # Para o listener imediatamente (não espera próxima tecla)
+    def on_exit(icon, item):
+        _stop_event.set()
         lst = _listener_ref.get("listener")
         try:
             if lst is not None:
                 lst.stop()
         except Exception:
             pass
-
         icon.stop()
 
-    def reset(icon, item):
-        try:
-            os.remove(str(CONFIG_PATH))
-            icon.notify("Credenciais removidas. Abra o app novamente para configurar.")
-        except Exception:
-            icon.notify("Não foi possível remover o arquivo de credenciais.")
+    image = load_icon_image()
 
     menu = pystray.Menu(
-        pystray.MenuItem("Sobre", lambda icon, item: show_about()),
-        pystray.MenuItem("Resetar credenciais", reset),
-        pystray.MenuItem("Sair", sair),
+        pystray.MenuItem("Status: Ativo", lambda i, it: None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Sobre", open_about),
+        pystray.MenuItem("Resetar Credenciais", open_reset),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Sair", on_exit),
     )
 
-    icon = pystray.Icon(
-        "AutoLogin",
-        load_icon_image(),
-        "AutoLogin (F12)",
-        menu,
-    )
+    icon = pystray.Icon(APP_SLUG, image, f"{APP_NAME} (F12)", menu)
 
-    # Alguns ambientes não suportam notify -> ignoramos falhas
     try:
         icon.notify("Suricato AutoLogin ativo (F12 para preencher)")
     except Exception:
         pass
 
     icon.run()
-# ------------------------------------------
 
 
+# ---------------- MAIN ----------------
 def main():
-    """Ponto de entrada principal.
+    _setup_signal_handlers()
+    acquire_single_instance_or_exit()
 
-    Fluxo:
-      1) load_or_setup() -> garante credenciais (setup inicial ou leitura do arquivo)
-      2) inicia listener de teclado em thread daemon
-      3) inicia tray_app() (loop principal do ícone)
-    """
-    usuario, senha = load_or_setup()
-
-    # Thread do listener em daemon para não travar o encerramento em caso de erro
-    t = threading.Thread(target=keyboard_listener, args=(usuario, senha), daemon=True)
-    t.start()
-
-    tray_app()
+    user, password = perform_login_or_setup()
+    start_keyboard_listener(user, password)
+    run_tray_icon(user, password)
 
 
 if __name__ == "__main__":
