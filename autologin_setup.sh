@@ -1,7 +1,35 @@
 #!/usr/bin/env bash
+# ======================================================================================
 # autologin_setup.sh
+# Suricato AutoLogin (F12) - Linux Setup/Build
+# Versão: 1.0
+# ======================================================================================
+# O que este script faz:
+#   1) Valida pré-requisitos (python3/pip/GUI para seleção de arquivo).
+#   2) Instala dependências (APT) de forma "best effort" e registra logs.
+#   3) Instala dependências Python (pip --user).
+#   4) Gera binário (PyInstaller onefile --noconsole) e instala:
+#        - executável em ~/Apps/autologin
+#        - ícone em ~/.local/share/icons/autologin.png
+#        - .desktop em ~/.local/share/applications/autologin.desktop
+#        - atalho na área de trabalho
+#
+# Por que adicionamos novas deps APT nesta v1.0:
+#   - pyautogui/pynput/pystray no Linux geralmente dependem de componentes do sistema:
+#       * python3-xlib (X11 bindings)
+#       * xclip / xdotool (ferramentas usadas por automação/clipboard/inputs)
+#       * python3-gi + GTK (para tray icon via pystray em muitos desktops)
+#       * libappindicator3-1 (em alguns ambientes para o ícone da bandeja)
+#
+# Observações:
+#   - O script mantém "best effort": tenta instalar e segue adiante; se faltar algo
+#     crítico, o app pode rodar sem tray ou sem automação.
+#   - Wayland: automação global (pynput/pyautogui) pode ser limitada. X11 é mais estável.
+# ======================================================================================
+
 set -euo pipefail
 
+VERSION="1.0"
 APP_NAME="Suricato AutoLogin (F12)"
 
 APPS_DIR="$HOME/Apps"
@@ -32,15 +60,18 @@ cli_progress() {
   local percent="$1"
   local msg="${2:-}"
   local blocks=$((percent/2))
-  local bar
-  bar="$(printf "%0.s#" $(seq 1 "$blocks" 2>/dev/null || true))"
+  local bar=""
+  # Evita erro quando blocks=0
+  if [ "$blocks" -gt 0 ] 2>/dev/null; then
+    bar="$(printf "%0.s#" $(seq 1 "$blocks" 2>/dev/null || true))"
+  fi
   printf "\r[%-50s] %3s%%  %s" "$bar" "$percent" "$msg"
 }
 
 progress_pipe() {
   if has_yad; then
     yad --progress \
-      --title="AutoLogin - Instalação/Atualização" \
+      --title="AutoLogin - Instalação/Atualização v$VERSION" \
       --text="Iniciando..." \
       --percentage=0 \
       --auto-close \
@@ -48,7 +79,7 @@ progress_pipe() {
       2>/dev/null
   elif has_zenity; then
     zenity --progress \
-      --title="AutoLogin - Instalação/Atualização" \
+      --title="AutoLogin - Instalação/Atualização v$VERSION" \
       --text="Iniciando..." \
       --percentage=0 \
       --auto-close \
@@ -140,6 +171,7 @@ apt_install_if_missing() {
 }
 
 run_step() {
+  # Executa o comando num shell login (-l) para respeitar PATH e ambiente do usuário
   local cmd="$1"
   log "RUN: $cmd"
   bash -lc "$cmd" >>"$LOG_FILE" 2>&1
@@ -173,8 +205,16 @@ mkdir -p "$APPS_DIR" "$(dirname "$DESKTOP_FILE")" "$ICON_DIR"
   fi
 
   echo "45"; echo "# Verificando dependências extras (APT)..."
+  # já existiam:
   apt_install_if_missing python3-tk || true
   apt_install_if_missing scrot || true
+  # novas (v1.0): aumentam compatibilidade de pynput/pyautogui/pystray no Linux (X11/GTK/tray)
+  apt_install_if_missing python3-xlib || true
+  apt_install_if_missing xclip || true
+  apt_install_if_missing xdotool || true
+  apt_install_if_missing python3-gi || true
+  apt_install_if_missing gir1.2-gtk-3.0 || true
+  apt_install_if_missing libappindicator3-1 || true
 
   echo "60"; echo "# Atualizando pip..."
   run_step "python3 -m pip install --user --upgrade pip"
@@ -203,6 +243,7 @@ ICON_PATH="$(pick_file "Selecione o ícone (PNG)" "PNG | *.png")"
 if [ ! -f "$PY_PATH" ]; then ui_error "Arquivo não encontrado: $PY_PATH"; exit 1; fi
 if [ ! -f "$ICON_PATH" ]; then ui_error "Ícone não encontrado: $ICON_PATH"; exit 1; fi
 
+# Dependências Python usadas/importadas no autologin.py (v1.0)
 REQ_PKGS=(pyautogui pynput cryptography pystray pillow pyinstaller)
 
 # ---- FASE 2: deps python + build + instalar atalhos ----
@@ -217,6 +258,8 @@ REQ_PKGS=(pyautogui pynput cryptography pystray pillow pyinstaller)
   echo "55"; echo "# Buildando executável (PyInstaller)..."
   cd "$BUILD_WORKDIR"
   rm -rf build dist autologin.spec 2>/dev/null || true
+
+  # Linux: separador do --add-data é ":" (origem:destino)
   run_step "python3 -m PyInstaller --onefile --noconsole --clean \
     --name autologin \
     --add-data \"$BUILD_WORKDIR/autologin.png:.\" \
@@ -231,14 +274,14 @@ REQ_PKGS=(pyautogui pynput cryptography pystray pillow pyinstaller)
   cp -f "$BUILD_WORKDIR/dist/autologin" "$BIN_OUT"
   chmod +x "$BIN_OUT" 2>/dev/null || true
 
-  # instala o ícone externo para o .desktop e também para fallback do app
+  # Ícone externo para o .desktop e fallback do app
   cp -f "$BUILD_WORKDIR/autologin.png" "$ICON_OUT"
 
-  echo "90"; echo "# Criando atalhos..."
+  echo "90"; echo "# Criando atalhos (.desktop)..."
   cat > "$DESKTOP_FILE" << EOF
 [Desktop Entry]
 Type=Application
-Version=1.0
+Version=$VERSION
 Name=$APP_NAME
 Comment=Preenche usuário/senha com F12 (rodando em segundo plano)
 Exec=$BIN_OUT
@@ -247,9 +290,11 @@ Terminal=false
 Categories=Utility;
 StartupNotify=false
 EOF
+
   chmod +x "$DESKTOP_FILE" 2>/dev/null || true
   update-desktop-database "$HOME/.local/share/applications" >>"$LOG_FILE" 2>&1 || true
 
+  # Atalho na área de trabalho
   DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
   DESKTOP_SHORTCUT="$DESKTOP_DIR/Suricato AutoLogin.desktop"
   mkdir -p "$DESKTOP_DIR"
@@ -269,7 +314,7 @@ if [ ! -x "$BIN_OUT" ]; then
   exit 1
 fi
 
-ui_info "Instalação concluída!\n\nExecutável:\n$BIN_OUT\n\nNo menu:\n$APP_NAME\n\nLog:\n$LOG_FILE"
+ui_info "Instalação concluída! (v$VERSION)\n\nExecutável:\n$BIN_OUT\n\nNo menu:\n$APP_NAME\n\nLog:\n$LOG_FILE"
 
 if ui_question "Deseja iniciar agora?"; then
   "$BIN_OUT" >/dev/null 2>&1 &
