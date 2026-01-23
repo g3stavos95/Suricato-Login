@@ -6,25 +6,24 @@
 # ======================================================================================
 # O que este script faz:
 #   1) Valida pré-requisitos (python3/pip/GUI para seleção de arquivo).
-#   2) Instala dependências (APT) de forma "best effort" e registra logs.
-#   3) Instala dependências Python (pip --user).
-#   4) Gera binário (PyInstaller onefile --noconsole) e instala:
+#   2) (Opcional) Pré-autentica sudo ANTES de abrir o progresso, para UX melhor.
+#   3) Instala dependências (APT) de forma "best effort" e registra logs.
+#   4) Instala dependências Python (pip --user).
+#   5) Gera binário (PyInstaller onefile --noconsole) e instala:
 #        - executável em ~/Apps/autologin
 #        - ícone em ~/.local/share/icons/autologin.png
 #        - .desktop em ~/.local/share/applications/autologin.desktop
 #        - atalho na área de trabalho
 #
-# Por que adicionamos novas deps APT nesta v1.0:
-#   - pyautogui/pynput/pystray no Linux geralmente dependem de componentes do sistema:
-#       * python3-xlib (X11 bindings)
-#       * xclip / xdotool (ferramentas usadas por automação/clipboard/inputs)
-#       * python3-gi + GTK (para tray icon via pystray em muitos desktops)
-#       * libappindicator3-1 (em alguns ambientes para o ícone da bandeja)
+# Por que a pré-autenticação sudo (warm-up) existe:
+#   - Antes, o progresso abria e, no primeiro apt-get, o sudo pedia senha no terminal.
+#     Isso parecia "travado" / ruim visualmente.
+#   - Agora: se o script realmente precisar de APT e o usuário não for root,
+#     pedimos a senha no início (sudo -v). Só depois iniciamos a fase de progresso.
 #
 # Observações:
-#   - O script mantém "best effort": tenta instalar e segue adiante; se faltar algo
-#     crítico, o app pode rodar sem tray ou sem automação.
-#   - Wayland: automação global (pynput/pyautogui) pode ser limitada. X11 é mais estável.
+#   - O script mantém "best effort" nas instalações APT: tenta instalar e segue.
+#   - Wayland: automação global pode ser limitada. X11 é mais estável.
 # ======================================================================================
 
 set -euo pipefail
@@ -61,7 +60,6 @@ cli_progress() {
   local msg="${2:-}"
   local blocks=$((percent/2))
   local bar=""
-  # Evita erro quando blocks=0
   if [ "$blocks" -gt 0 ] 2>/dev/null; then
     bar="$(printf "%0.s#" $(seq 1 "$blocks" 2>/dev/null || true))"
   fi
@@ -177,6 +175,74 @@ run_step() {
   bash -lc "$cmd" >>"$LOG_FILE" 2>&1
 }
 
+# ======================================================================================
+# NOVO (v1.0): Pré-autenticação sudo (warm-up) para UX melhor
+# --------------------------------------------------------------------------------------
+# Como funciona:
+#   - Detecta se algum pacote APT que o script pode instalar está faltando.
+#   - Se faltar e o usuário NÃO é root, pedimos a senha UMA vez com "sudo -v".
+#   - Isso evita travar no meio da barra de progresso esperando senha no terminal.
+# ======================================================================================
+
+apt_missing_any() {
+  # Retorna 0 (true) se houver pelo menos 1 pacote faltando; 1 caso contrário.
+  # Se não houver dpkg (raro em Debian/Ubuntu), assume que pode faltar (retorna 0)
+  if ! command -v dpkg >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local pkgs=(
+    python3-pip
+    yad
+    zenity
+    python3-tk
+    scrot
+    python3-xlib
+    xclip
+    xdotool
+    python3-gi
+    gir1.2-gtk-3.0
+    libappindicator3-1
+  )
+
+  local p
+  for p in "${pkgs[@]}"; do
+    if ! dpkg -s "$p" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_sudo_ticket() {
+  # Só faz sentido se:
+  #   - não é root
+  #   - existe sudo
+  #   - e realmente há algo faltando para instalar via APT
+  if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+    return 0
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! apt_missing_any; then
+    # Nada para instalar via APT => não pede senha à toa
+    return 0
+  fi
+
+  log "Pré-autenticação sudo: será solicitada a senha para instalar dependências."
+  echo "Este setup precisa instalar dependências (APT)."
+  echo "Digite sua senha (sudo) para continuar..."
+
+  # -v valida/renova ticket do sudo. Se falhar (senha errada/cancelado), aborta.
+  if ! sudo -v; then
+    ui_error "Falha ao autenticar sudo. Tente novamente e digite a senha correta."
+    exit 1
+  fi
+
+  log "sudo OK (ticket ativo). Continuando instalação."
+}
+
 # -------- pre-req checks --------
 if ! command -v python3 >/dev/null 2>&1; then
   ui_error "python3 não encontrado. Instale com: sudo apt install python3"
@@ -184,6 +250,9 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 mkdir -p "$APPS_DIR" "$(dirname "$DESKTOP_FILE")" "$ICON_DIR"
+
+# >>> NOVO: pede sudo ANTES de abrir progresso (somente se necessário)
+ensure_sudo_ticket
 
 # ---- FASE 1: preparar instalador (com progresso) ----
 (
@@ -205,10 +274,8 @@ mkdir -p "$APPS_DIR" "$(dirname "$DESKTOP_FILE")" "$ICON_DIR"
   fi
 
   echo "45"; echo "# Verificando dependências extras (APT)..."
-  # já existiam:
   apt_install_if_missing python3-tk || true
   apt_install_if_missing scrot || true
-  # novas (v1.0): aumentam compatibilidade de pynput/pyautogui/pystray no Linux (X11/GTK/tray)
   apt_install_if_missing python3-xlib || true
   apt_install_if_missing xclip || true
   apt_install_if_missing xdotool || true
